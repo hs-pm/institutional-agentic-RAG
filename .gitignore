@@ -24,6 +24,7 @@ wheels/
 # Virtual Environment
 venv/
 ENV/
+rag_env/
 
 # IDE
 .idea/
@@ -34,6 +35,8 @@ ENV/
 # Project specific
 faiss.index
 matched_texts_*.txt
+search_results_*.txt
+rag_api_flow.log
 .env
 data/
 logs/

@@ -175,4 +175,58 @@ The application maintains detailed logs in `rag_api_flow.log`, tracking:
 - Adaptive indexing strategy based on dataset size
 - Efficient chunk management with hash-based deduplication
 - Thread-safe data loading with mutex locks
-- Automatic index updates on file changes 
+- Automatic index updates on file changes
+
+## Running with Docker (Recommended)
+
+The easiest way to run the API is using Docker:
+
+1. Build and start the container:
+```bash
+docker-compose up --build
+```
+
+2. The API will be available at http://localhost:8000
+
+3. To stop the service:
+```bash
+docker-compose down
+```
+
+Note: The `data` directory and FAISS index are mounted as volumes, so your data and index persist between container restarts.
+
+## Environment Setup (Without Docker)
+
+If you prefer to run without Docker:
+
+1. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+2. Create data directory:
+```bash
+mkdir -p data
+```
+
+3. Run the API:
+```bash
+python main.py
+```
+
+## API Usage
+
+Search endpoint:
+```bash
+curl -X POST "http://localhost:8000/search" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "your search query", "context": ""}'
+```
+
+## Configuration
+
+- FAISS vector dimension: 384
+- Text chunk size: 512
+- Chunk overlap: 50
+- Model: sentence-transformers for embeddings
+- Data directory: /app/data (Docker) or ./data (local) 

@@ -448,8 +448,8 @@ def search(input: SearchInput):
             # except Exception as e:
             #     log_step("FILE_WRITE_ERROR", f"error saving results: {str(e)}", "ERROR")
             
-            # log_step("API_SEARCH_SUCCESS", f"response_summary_length={len(summary)}, total_results={valid_indices + len(matched_docs) + len(matched_slacks)}")
-            # return response
+            log_step("API_SEARCH_SUCCESS", f"response_summary_length={len(summary)}, total_results={valid_indices + len(matched_docs) + len(matched_slacks)}")
+            return response
             
     except Exception as e:
         log_step("API_SEARCH_ERROR", f"critical_error={str(e)}", "ERROR")
