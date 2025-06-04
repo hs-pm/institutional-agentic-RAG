@@ -7,7 +7,15 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
-      - ./faiss.index:/app/faiss.index
+      - ./faiss.index:/app/faiss.index:rw
+      - transformer_cache:/root/.cache/huggingface
+      - model_cache:/root/.cache/torch
     environment:
       - DATA_DIR=/app/data
-    restart: unless-stopped 
+      - TRANSFORMERS_CACHE=/root/.cache/huggingface
+      - TORCH_HOME=/root/.cache/torch
+    restart: unless-stopped
+
+volumes:
+  transformer_cache:
+  model_cache: 
