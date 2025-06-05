@@ -10,7 +10,8 @@ import numpy as np  # Fixed: Move numpy import to top
 import logging
 from datetime import datetime
 from typing import List
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from watchdog.observers import Observer
@@ -25,6 +26,41 @@ INDEX_FILE = "faiss.index"
 LOG_FILE = "rag_api_flow.log"
 model = SentenceTransformer('all-MiniLM-L6-v2')
 app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # Frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+# Create router and include it
+router = APIRouter()
+app.include_router(router)
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for container orchestration"""
+    try:
+        # Check if index is initialized
+        if not index:
+            return {"status": "degraded", "message": "Search index not initialized"}
+        
+        # Check data directory
+        if not os.path.exists(DATA_DIR):
+            return {"status": "degraded", "message": "Data directory not accessible"}
+            
+        return {
+            "status": "healthy",
+            "index_size": index.ntotal if index else 0,
+            "chunks": len(all_text_chunks),
+            "documents": len(txt_docs),
+            "metadata": len(doc_metadata)
+        }
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
 
 @app.on_event("startup")
 async def startup_event():
@@ -69,6 +105,14 @@ def chunk_text(text, chunk_size=512, overlap=50):
         chunks.append(text[i:i + chunk_size])
     log_step("TEXT_CHUNKING_COMPLETE", f"created {len(chunks)} chunks")
     return chunks
+def filter_chunks(all_chunks, metadata, author=None, platform=None, start_date=None, end_date=None):
+    # Use same filtering logic as metadata
+    filtered_items = filter_metadata(metadata, author, platform, start_date, end_date)
+
+    # Now, select chunks that match those filtered items
+    titles = {item['title'] for item in filtered_items if 'title' in item}
+    return [chunk for chunk in all_chunks if any(title in chunk for title in titles)], filtered_items
+
 
 def hash_text(text):
     log_step("HASH_TEXT_START", f"text_length={len(text)}")
@@ -80,6 +124,38 @@ def hash_text(text):
 class SearchInput(BaseModel):
     query: str = ""
     context: str = ""
+    author: str = None
+    platform: str = None  # e.g., "slack", "document"
+    start_date: str = None  # ISO date: "2024-01-01"
+    end_date: str = None
+
+from datetime import datetime
+
+def filter_metadata(data, author=None, platform=None, start_date=None, end_date=None):
+    def matches(item):
+        if author and author.lower() not in item.get("author", "").lower():
+            return False
+        if platform and platform.lower() not in item.get("platform", "").lower():
+            return False
+        date_str = item.get("date", "")  # expected ISO format
+        if start_date and date_str:
+            try:
+                item_date = datetime.fromisoformat(date_str)
+                if datetime.fromisoformat(start_date) > item_date:
+                    return False
+            except ValueError:
+                return False
+        if end_date and date_str:
+            try:
+                item_date = datetime.fromisoformat(date_str)
+                if datetime.fromisoformat(end_date) < item_date:
+                    return False
+            except ValueError:
+                return False
+        return True
+
+    return [item for item in data if matches(item)]
+
 
 # --- SUMMARIZATION ---
 def generate_summary(query, context, matched_text):
@@ -301,15 +377,19 @@ def extract_top_keywords(text, top_n=5):
     return [word for word, count in freq.most_common(top_n)]
 
 # --- API ---
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from datetime import datetime
+
 @app.post("/search")
 def search(input: SearchInput):
     log_step("API_SEARCH_REQUEST", f"query='{input.query}', context_length={len(input.context)}")
-    
+
     try:
         with lock:
             log_step("API_LOCK_ACQUIRED", "search lock acquired")
-            
-            # Validation checks
+
             if not index:
                 log_step("API_VALIDATION_ERROR", "index not initialized", "ERROR")
                 return {"error": "Index not initialized."}
@@ -322,139 +402,70 @@ def search(input: SearchInput):
                 log_step("API_VALIDATION_ERROR", "empty query provided", "ERROR")
                 return {"error": "Query cannot be empty."}
 
-            # Handle empty index
             if not all_text_chunks:
                 log_step("API_EMPTY_INDEX", "no indexed content available")
                 return {
                     "summary": {
                         "text": "No indexed content available.",
-                        "matchCount": {"total": 0, "slack": 0, "docs": 0 },
+                        "matchCount": {"total": 0, "slack": 0, "docs": 0},
                         "topKeywords": []
                     },
                     "documents": [],
                     "slackDiscussions": []
-                                    }
+                }
 
-            # Perform vector search
+            # Encode query and perform vector search
             log_step("VECTOR_SEARCH_START", f"encoding query: '{query}'")
             query_vector = model.encode([query]).astype('float32')
             k = min(10, len(all_text_chunks))
             log_step("VECTOR_SEARCH_EXECUTE", f"searching with k={k}, total_chunks={len(all_text_chunks)}")
-            
             D, I = index.search(query_vector, k=k)
             log_step("VECTOR_SEARCH_COMPLETE", f"found {len(I[0])} results, distances={D[0][:3].tolist()}")
-            
-            # Extract matched texts
-            matched_texts = []
-            valid_indices = 0
-            for i in I[0]:
-                if 0 <= i < len(all_text_chunks):
-                    matched_texts.append(all_text_chunks[i])
-                    valid_indices += 1
-            
-            log_step("MATCHED_TEXTS_EXTRACTED", f"valid_matches={valid_indices}, total_text_length={sum(len(t) for t in matched_texts)}")
 
-            # Generate summary
+            matched_texts = [all_text_chunks[i] for i in I[0] if 0 <= i < len(all_text_chunks)]
+            log_step("MATCHED_TEXTS_EXTRACTED", f"valid_matches={len(matched_texts)}, total_text_length={sum(len(t) for t in matched_texts)}")
+
             matched_text_combined = "\n\n".join(matched_texts[:3])
             log_step("SUMMARY_GENERATION_START", f"combining top {min(3, len(matched_texts))} matches")
             summary = generate_summary(query, context, matched_text_combined)
 
-            # Match metadata
-            log_step("METADATA_MATCHING_START", "searching metadata for keyword matches")
-            # def match_metadata(data):
-            #     matches = [item for item in data if any(word in item.get("title", "").lower() and len(word) > 2 for word in query.lower().split() if word not in ['the', 'and', 'or', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'])]
-            #     return matches
-            
-
-            from sklearn.metrics.pairwise import cosine_similarity
-            import numpy as np
-            from sentence_transformers import SentenceTransformer
-
-            # Initialize the model
-
-
             def match_metadata(data, query_vector, top_k=5):
-                """
-                This function matches metadata items to the query based on vector similarity.
-                It uses cosine similarity to rank metadata items according to their semantic relevance to the query.
-                
-                Args:
-                - data: List of metadata items (documents, discussions, etc.)
-                - query_vector: Vector representation of the query (must be a 1D array)
-                - top_k: The number of top matches to return
-                
-                Returns:
-                - matches: List of metadata items that are semantically most similar to the query
-                """
-                matches = []
-                metadata_vectors = []
-                
-                # Encode each metadata item into a vector
-                for item in data:
-                    combined = f"{item.get('title', '')} {item.get('description', '')}"
-                    metadata_vector = model.encode(combined).astype('float32')
-                    metadata_vectors.append(metadata_vector)
-                
-                # Convert metadata_vectors to a 2D numpy array (shape: n_samples, vector_size)
+                metadata_vectors = [
+                    model.encode(f"{item.get('title', '')} {item.get('description', '')}").astype('float32')
+                    for item in data
+                ]
                 metadata_vectors = np.array(metadata_vectors)
-                
-                # Ensure the query_vector is 2D (shape: 1, vector_size)
                 query_vector = np.array(query_vector).reshape(1, -1)
-                
-                # Compute cosine similarity between the query vector and all metadata vectors
                 similarities = cosine_similarity(query_vector, metadata_vectors)[0]
-                
-                # Get top-k indices based on highest similarity
                 top_indices = np.argsort(similarities)[::-1][:top_k]
-                
-                # Collect top matches based on similarity
-                for idx in top_indices:
-                    matches.append(data[idx])
-                
-                return matches
+                return [data[idx] for idx in top_indices]
 
-
-
-            matched_docs = match_metadata(doc_metadata,query_vector)
-            matched_slacks = match_metadata(slack_data,query_vector)
+            log_step("METADATA_MATCHING_START", "searching metadata for keyword matches")
+            matched_docs = match_metadata(doc_metadata, query_vector)
+            matched_slacks = match_metadata(slack_data, query_vector)
             log_step("METADATA_MATCHING_COMPLETE", f"matched_docs={len(matched_docs)}, matched_slacks={len(matched_slacks)}")
-    
-            # Prepare response
+
             response = {
                 "summary": {
                     "text": summary,
                     "matchCount": {
-                        "total": len(matched_slacks)+len(matched_docs),
+                        "total": len(matched_slacks) + len(matched_docs),
                         "slack": len(matched_slacks),
                         "docs": len(matched_docs),
                     },
                     "topKeywords": extract_top_keywords(matched_text_combined)
-
                 },
                 "documents": matched_docs,
                 "slackDiscussions": matched_slacks
-                            }
-            
-            # Write response to file
-            # try:
-            #     output_file = f"search_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            #     with open(output_file, 'w', encoding='utf-8') as f:
-            #         f.write(json.dumps(response, indent=2))
-            #     output_file = f"matched_texts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            #     with open(output_file, 'w', encoding='utf-8') as f:
-            #         json.dump(doc_metadata, f, ensure_ascii=False, indent=4)
-     
-            #     log_step("SEARCH_RESULTS_SAVED", f"results saved to {output_file}")
-            # except Exception as e:
-            #     log_step("FILE_WRITE_ERROR", f"error saving results: {str(e)}", "ERROR")
-            
-            log_step("API_SEARCH_SUCCESS", f"response_summary_length={len(summary)}, total_results={valid_indices + len(matched_docs) + len(matched_slacks)}")
+            }
+
+            log_step("API_SEARCH_SUCCESS", f"response_summary_length={len(summary)}, total_results={len(matched_texts) + len(matched_docs) + len(matched_slacks)}")
             return response
-            
+
     except Exception as e:
         log_step("API_SEARCH_ERROR", f"critical_error={str(e)}", "ERROR")
-        print(f"[ERROR] Search failed: {e}")
         return {"error": f"Search failed: {str(e)}"}
+
 
 # --- MAIN ---
 if __name__ == "__main__":
