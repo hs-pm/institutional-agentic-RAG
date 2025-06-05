@@ -4,15 +4,20 @@ buildCommand = """
 python -m venv /opt/venv
 . /opt/venv/bin/activate
 pip install --upgrade pip
+pip install wheel setuptools
 pip install -r requirements.txt
 """
 
 [deploy]
-startCommand = ". /opt/venv/bin/activate && python -m uvicorn main:app --host 0.0.0.0 --port $PORT"
+startCommand = """
+export PATH="/opt/venv/bin:$PATH"
+/opt/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+"""
 healthcheckPath = "/health"
 healthcheckTimeout = 100
 restartPolicyType = "on_failure"
 
 [deploy.env]
 PYTHON_VERSION = "3.10"
-PATH = "/opt/venv/bin:$PATH" 
+PYTHONPATH = "/app"
+PATH = "/opt/venv/bin:/usr/local/bin:/usr/bin:/bin:$PATH" 
