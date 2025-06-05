@@ -10,13 +10,14 @@ import numpy as np  # Fixed: Move numpy import to top
 import logging
 from datetime import datetime
 from typing import List
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from threading import Lock
+from pathlib import Path
 
 # --- CONFIG ---
 DATA_DIR = "./data"
@@ -135,8 +136,13 @@ def filter_metadata(data, author=None, platform=None, start_date=None, end_date=
     def matches(item):
         if author and author.lower() not in item.get("author", "").lower():
             return False
-        if platform and platform.lower() not in item.get("platform", "").lower():
+            
+        # Infer platform based on item structure
+        item_platform = "slack" if all(key in item for key in ["channel", "replies", "reactions"]) else "document"
+        
+        if platform and platform.lower() != "both" and platform.lower() != item_platform:
             return False
+            
         date_str = item.get("date", "")  # expected ISO format
         if start_date and date_str:
             try:
@@ -396,7 +402,8 @@ def search(input: SearchInput):
 
             query = input.query.strip()
             context = input.context.strip()
-            log_step("API_INPUT_PROCESSED", f"cleaned_query='{query}', context_length={len(context)}")
+            platform = input.platform.lower() if input.platform else None
+            log_step("API_INPUT_PROCESSED", f"cleaned_query='{query}', context_length={len(context)}, platform={platform}")
 
             if not query:
                 log_step("API_VALIDATION_ERROR", "empty query provided", "ERROR")
@@ -414,15 +421,35 @@ def search(input: SearchInput):
                     "slackDiscussions": []
                 }
 
-            # Encode query and perform vector search
+            # Apply platform filtering first
+            filtered_chunks, filtered_metadata = filter_chunks(all_text_chunks, doc_metadata + slack_data, platform=platform)
+            if not filtered_chunks:
+                log_step("API_FILTER_RESULT", f"no chunks match platform filter: {platform}")
+                return {
+                    "summary": {
+                        "text": f"No content found for platform: {platform}",
+                        "matchCount": {"total": 0, "slack": 0, "docs": 0},
+                        "topKeywords": []
+                    },
+                    "documents": [],
+                    "slackDiscussions": []
+                }
+
+            # Encode query and perform vector search on filtered chunks
             log_step("VECTOR_SEARCH_START", f"encoding query: '{query}'")
             query_vector = model.encode([query]).astype('float32')
-            k = min(10, len(all_text_chunks))
-            log_step("VECTOR_SEARCH_EXECUTE", f"searching with k={k}, total_chunks={len(all_text_chunks)}")
-            D, I = index.search(query_vector, k=k)
+            k = min(10, len(filtered_chunks))
+            
+            # Create temporary index for filtered chunks
+            filtered_vectors = np.array([model.encode(chunk).astype('float32') for chunk in filtered_chunks])
+            temp_index = faiss.IndexFlatL2(filtered_vectors.shape[1])
+            temp_index.add(filtered_vectors)
+            
+            log_step("VECTOR_SEARCH_EXECUTE", f"searching with k={k}, total_filtered_chunks={len(filtered_chunks)}")
+            D, I = temp_index.search(query_vector, k=k)
             log_step("VECTOR_SEARCH_COMPLETE", f"found {len(I[0])} results, distances={D[0][:3].tolist()}")
 
-            matched_texts = [all_text_chunks[i] for i in I[0] if 0 <= i < len(all_text_chunks)]
+            matched_texts = [filtered_chunks[i] for i in I[0] if 0 <= i < len(filtered_chunks)]
             log_step("MATCHED_TEXTS_EXTRACTED", f"valid_matches={len(matched_texts)}, total_text_length={sum(len(t) for t in matched_texts)}")
 
             matched_text_combined = "\n\n".join(matched_texts[:3])
@@ -430,6 +457,8 @@ def search(input: SearchInput):
             summary = generate_summary(query, context, matched_text_combined)
 
             def match_metadata(data, query_vector, top_k=5):
+                if not data:
+                    return []
                 metadata_vectors = [
                     model.encode(f"{item.get('title', '')} {item.get('description', '')}").astype('float32')
                     for item in data
@@ -440,9 +469,16 @@ def search(input: SearchInput):
                 top_indices = np.argsort(similarities)[::-1][:top_k]
                 return [data[idx] for idx in top_indices]
 
+            # Split filtered metadata by platform
+            def infer_platform(item):
+                return "slack" if all(key in item for key in ["channel", "replies", "reactions"]) else "document"
+                
+            filtered_docs = [item for item in filtered_metadata if infer_platform(item) == "document"]
+            filtered_slacks = [item for item in filtered_metadata if infer_platform(item) == "slack"]
+
             log_step("METADATA_MATCHING_START", "searching metadata for keyword matches")
-            matched_docs = match_metadata(doc_metadata, query_vector)
-            matched_slacks = match_metadata(slack_data, query_vector)
+            matched_docs = match_metadata(filtered_docs, query_vector)
+            matched_slacks = match_metadata(filtered_slacks, query_vector)
             log_step("METADATA_MATCHING_COMPLETE", f"matched_docs={len(matched_docs)}, matched_slacks={len(matched_slacks)}")
 
             response = {
@@ -466,6 +502,87 @@ def search(input: SearchInput):
         log_step("API_SEARCH_ERROR", f"critical_error={str(e)}", "ERROR")
         return {"error": f"Search failed: {str(e)}"}
 
+@app.get("/files")
+async def list_files():
+    try:
+        data_dir = Path("data")
+        if not data_dir.exists():
+            return {"files": []}
+            
+        files = []
+        for file_path in data_dir.glob("*"):
+            if file_path.is_file():
+                stats = file_path.stat()
+                files.append({
+                    "name": file_path.name,
+                    "path": str(file_path),
+                    "size": stats.st_size,
+                    "modified": datetime.fromtimestamp(stats.st_mtime).isoformat()
+                })
+        
+        return {"files": files}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/files/{filename}/content")
+async def get_file_content(filename: str):
+    try:
+        # Sanitize filename to prevent directory traversal
+        safe_filename = os.path.basename(filename)
+        file_path = os.path.join("data", safe_filename)
+        
+        # Verify file exists and is within data directory
+        abs_path = os.path.abspath(file_path)
+        data_dir_path = os.path.abspath("data")
+        if not abs_path.startswith(data_dir_path):
+            raise HTTPException(status_code=403, detail="Access denied")
+            
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found")
+            
+        # Read file content
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            
+        return {"content": content}
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    try:
+        # Validate file type
+        allowed_types = [".txt", ".pdf", ".doc", ".docx"]
+        file_ext = os.path.splitext(file.filename)[1].lower()
+        if file_ext not in allowed_types:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"File type not allowed. Allowed types: {', '.join(allowed_types)}"
+            )
+
+        # Save file
+        file_path = os.path.join(DATA_DIR, file.filename)
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+        # Get file stats
+        stats = os.stat(file_path)
+        
+        # Return file info
+        return {
+            "name": file.filename,
+            "size": stats.st_size,
+            "type": file.content_type,
+            "modified": datetime.fromtimestamp(stats.st_mtime).isoformat()
+        }
+
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- MAIN ---
 if __name__ == "__main__":
